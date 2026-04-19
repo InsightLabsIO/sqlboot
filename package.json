@@ -1,0 +1,35 @@
+{
+  "name": "sqlboot",
+  "version": "1.0.0",
+  "description": "Cross-platform npm CLI for Oracle SQL*Plus, Docker Oracle XE, rlwrap, and the sqlboot command.",
+  "license": "MIT",
+  "bin": {
+    "sqlboot": "bin/sqlboot.js"
+  },
+  "files": [
+    "bin/",
+    "sqlboot",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node --check bin/sqlboot.js && bash -n sqlboot",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "keywords": [
+    "oracle",
+    "sqlplus",
+    "docker",
+    "oracle-xe",
+    "cli",
+    "installer",
+    "sqlboot"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

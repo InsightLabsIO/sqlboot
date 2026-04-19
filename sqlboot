@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+#
+# sqlboot
+# Cross-platform installer and launcher for Docker Oracle XE, Oracle SQL*Plus,
+# and rlwrap on macOS and Ubuntu-based Linux.
+#
+# First run:
+#   chmod +x sqlboot
+#   ./sqlboot
+#
+# After setup:
+#   sqlboot
+#   SQL> conn system/1234@XE
+
+set -Eeuo pipefail
+
+# -----------------------------
+# Defaults
+# -----------------------------
+
+APP_NAME="sqlboot"
+INSTALL_PATH="/usr/local/bin/sqlboot"
+
+ORACLE_IMAGE="${SQLBOOT_ORACLE_IMAGE:-gvenzl/oracle-xe:21-slim}"
+ORACLE_CONTAINER="${SQLBOOT_ORACLE_CONTAINER:-oracle-xe}"
+ORACLE_PASSWORD="${SQLBOOT_ORACLE_PASSWORD:-1234}"
+ORACLE_PORT="${SQLBOOT_ORACLE_PORT:-1521}"
+ORACLE_SERVICE="${SQLBOOT_ORACLE_SERVICE:-XEPDB1}"
+
+ORACLE_BASE_DIR="${SQLBOOT_ORACLE_BASE_DIR:-$HOME/oracle}"
+INSTANTCLIENT_PARENT="${SQLBOOT_INSTANTCLIENT_PARENT:-$ORACLE_BASE_DIR/instantclient}"
+TNS_ADMIN_DIR="$INSTANTCLIENT_PARENT/network/admin"
+TNSNAMES_FILE="$TNS_ADMIN_DIR/tnsnames.ora"
+SQLPLUS_HISTORY="${SQLBOOT_SQLPLUS_HISTORY:-$HOME/.sqlplus_history}"
+
+READY_TIMEOUT_SECONDS="${SQLBOOT_READY_TIMEOUT_SECONDS:-900}"
+DOCKER_READY_TIMEOUT_SECONDS="${SQLBOOT_DOCKER_READY_TIMEOUT_SECONDS:-180}"
+
+LINUX_IC_VERSION="21.19.0.0.0dbru"
+# Oracle publishes 21.x ZIPs for Linux x86_64. For macOS Intel, Oracle's
+# public Instant Client ZIP packages are 19.x and are compatible with Oracle
+# Database 21c. Override SQLBOOT_IC_BASIC_URL and SQLBOOT_IC_SQLPLUS_URL if
+# you have a different macOS package source.
+MACOS_IC_VERSION="19.8.0.0.0dbru"
+LINUX_IC_DIR_VERSION="2119000"
+MACOS_IC_DIR_VERSION="198000"
+
+LINUX_BASIC_URL_DEFAULT="https://download.oracle.com/otn_software/linux/instantclient/${LINUX_IC_DIR_VERSION}/instantclient-basic-linux.x64-${LINUX_IC_VERSION}.zip"
+LINUX_SQLPLUS_URL_DEFAULT="https://download.oracle.com/otn_software/linux/instantclient/${LINUX_IC_DIR_VERSION}/instantclient-sqlplus-linux.x64-${LINUX_IC_VERSION}.zip"
+MACOS_BASIC_URL_DEFAULT="https://download.oracle.com/otn_software/mac/instantclient/${MACOS_IC_DIR_VERSION}/instantclient-basic-macos.x64-${MACOS_IC_VERSION}.zip"
+MACOS_SQLPLUS_URL_DEFAULT="https://download.oracle.com/otn_software/mac/instantclient/${MACOS_IC_DIR_VERSION}/instantclient-sqlplus-macos.x64-${MACOS_IC_VERSION}.zip"
+
+OS_TYPE=""
+OS_ARCH=""
+PROFILE_FILE=""
+LIB_PATH_VAR=""
+IC_BASIC_URL=""
+IC_SQLPLUS_URL=""
+DOCKER_PLATFORM_ARGS=()
+
+# -----------------------------
+# Logging
+# -----------------------------
+
+log_info() {
+  printf '[INFO] %s\n' "$*"
+}
+
+log_ok() {
+  printf '[OK] %s\n' "$*"
+}
+
+log_error() {
+  printf '[ERROR] %s\n' "$*" >&2
+}
+
+die() {
+  log_error "$*"
+  exit 1
+}
+
+on_error() {
+  local exit_code=$?
+  local line_no=${1:-unknown}
+  log_error "Command failed near line ${line_no}. Exit code: ${exit_code}"
+  exit "$exit_code"
+}
+
+trap 'on_error "$LINENO"' ERR
+
+# -----------------------------
+# Common helpers
+# -----------------------------
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+need_sudo() {
+  [[ "${EUID:-$(id -u)}" -ne 0 ]]
+}
+
+run_sudo() {
+  if need_sudo; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+ensure_dir() {
+  mkdir -p "$1"
+}
+
+append_once() {
+  local file=$1
+  local marker=$2
+  local block=$3
+
+  touch "$file"
+  if grep -Fq "$marker" "$file"; then
+    log_ok "Environment block already present in $file"
+    return 0
+  fi
+
+  {
+    printf '\n%s\n' "$marker"
+    printf '%s\n' "$block"
+  } >>"$file"
+  log_ok "Updated $file"
+}
+
+latest_instantclient_dir() {
+  local dir
+  dir="$(find "$INSTANTCLIENT_PARENT" -maxdepth 1 -type d -name 'instantclient_*' 2>/dev/null | sort | tail -n 1 || true)"
+  printf '%s\n' "$dir"
+}
+
+sqlplus_path() {
+  local dir
+  dir="$(latest_instantclient_dir)"
+  if [[ -n "$dir" && -x "$dir/sqlplus" ]]; then
+    printf '%s\n' "$dir/sqlplus"
+  fi
+}
+
+require_command() {
+  command_exists "$1" || die "Required command not found: $1"
+}
+
+# -----------------------------
+# OS detection
+# -----------------------------
+
+detect_os() {
+  OS_ARCH="$(uname -m)"
+
+  case "$(uname -s)" in
+    Darwin)
+      OS_TYPE="macos"
+      PROFILE_FILE="$HOME/.zshrc"
+      LIB_PATH_VAR="DYLD_LIBRARY_PATH"
+      IC_BASIC_URL="${SQLBOOT_IC_BASIC_URL:-$MACOS_BASIC_URL_DEFAULT}"
+      IC_SQLPLUS_URL="${SQLBOOT_IC_SQLPLUS_URL:-$MACOS_SQLPLUS_URL_DEFAULT}"
+
+      if [[ "$OS_ARCH" == "arm64" ]]; then
+        DOCKER_PLATFORM_ARGS=(--platform linux/amd64)
+        log_info "Apple Silicon detected. Docker will use linux/amd64 for Oracle XE."
+      elif [[ "$OS_ARCH" != "x86_64" ]]; then
+        die "Unsupported macOS architecture: $OS_ARCH"
+      fi
+      ;;
+
+    Linux)
+      OS_TYPE="linux"
+      PROFILE_FILE="$HOME/.bashrc"
+      LIB_PATH_VAR="LD_LIBRARY_PATH"
+      IC_BASIC_URL="${SQLBOOT_IC_BASIC_URL:-$LINUX_BASIC_URL_DEFAULT}"
+      IC_SQLPLUS_URL="${SQLBOOT_IC_SQLPLUS_URL:-$LINUX_SQLPLUS_URL_DEFAULT}"
+
+      if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        local distro="${ID:-}"
+        local like="${ID_LIKE:-}"
+        if [[ "$distro" != "ubuntu" && "$distro" != "zorin" && "$like" != *"ubuntu"* && "$like" != *"debian"* ]]; then
+          die "Unsupported Linux distribution: ${PRETTY_NAME:-unknown}. This installer supports Ubuntu-based Linux, including Zorin OS."
+        fi
+      else
+        die "Cannot detect Linux distribution because /etc/os-release is missing."
+      fi
+
+      if [[ "$OS_ARCH" != "x86_64" && "$OS_ARCH" != "amd64" ]]; then
+        die "Unsupported Linux architecture: $OS_ARCH. Oracle Instant Client 21.x defaults here require x86_64."
+      fi
+      ;;
+
+    *)
+      die "Unsupported operating system: $(uname -s)"
+      ;;
+  esac
+
+  log_ok "Detected $OS_TYPE ($OS_ARCH)"
+}
+
+# -----------------------------
+# Package manager setup
+# -----------------------------
+
+install_homebrew_if_missing() {
+  if command_exists brew; then
+    log_ok "Homebrew is already installed"
+    return 0
+  fi
+
+  log_info "Installing Homebrew"
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+
+  command_exists brew || die "Homebrew installation completed, but brew is not available in PATH."
+  log_ok "Homebrew installed"
+}
+
+install_packages_macos() {
+  install_homebrew_if_missing
+
+  log_info "Installing required macOS packages"
+  brew list curl >/dev/null 2>&1 || brew install curl
+  brew list unzip >/dev/null 2>&1 || brew install unzip
+  brew list rlwrap >/dev/null 2>&1 || brew install rlwrap
+  log_ok "Required macOS packages are available"
+}
+
+install_packages_linux() {
+  require_command apt-get
+
+  log_info "Installing required Linux packages"
+  run_sudo apt-get update
+  run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y curl unzip rlwrap ca-certificates
+  if ! dpkg -s libaio1 >/dev/null 2>&1 && ! dpkg -s libaio1t64 >/dev/null 2>&1; then
+    run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y libaio1 || \
+      run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y libaio1t64
+  fi
+  log_ok "Required Linux packages are available"
+}
+
+install_required_packages() {
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    install_packages_macos
+  else
+    install_packages_linux
+  fi
+
+  require_command curl
+  require_command unzip
+  require_command rlwrap
+}
+
+# -----------------------------
+# Docker installation and setup
+# -----------------------------
+
+docker_is_ready() {
+  command_exists docker && docker info >/dev/null 2>&1
+}
+
+launch_docker_macos() {
+  if docker_is_ready; then
+    log_ok "Docker is running"
+    return 0
+  fi
+
+  log_info "Launching Docker Desktop"
+  open -a Docker || true
+
+  local elapsed=0
+  while (( elapsed < DOCKER_READY_TIMEOUT_SECONDS )); do
+    if docker_is_ready; then
+      log_ok "Docker is ready"
+      return 0
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+
+  die "Docker Desktop did not become ready within ${DOCKER_READY_TIMEOUT_SECONDS}s. Open Docker Desktop once, finish any first-run setup, then run this installer again."
+}
+
+install_docker_macos() {
+  install_homebrew_if_missing
+
+  if command_exists docker; then
+    log_ok "Docker CLI is already installed"
+  else
+    log_info "Installing Docker Desktop"
+    brew install --cask docker
+    log_ok "Docker Desktop installed"
+  fi
+
+  if [[ "$OS_ARCH" == "arm64" && ! -e /Library/Apple/usr/libexec/oah/libRosettaRuntime ]]; then
+    log_info "Installing Rosetta 2 for x86_64 Oracle Instant Client compatibility"
+    softwareupdate --install-rosetta --agree-to-license || true
+  fi
+
+  launch_docker_macos
+}
+
+install_docker_linux() {
+  if command_exists docker; then
+    log_ok "Docker is already installed"
+  else
+    log_info "Installing docker.io"
+    run_sudo apt-get update
+    run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+    log_ok "docker.io installed"
+  fi
+
+  log_info "Enabling Docker service"
+  run_sudo systemctl enable docker
+  run_sudo systemctl start docker
+
+  if ! docker_is_ready; then
+    if need_sudo && run_sudo docker info >/dev/null 2>&1; then
+      log_info "Adding current user to docker group"
+      run_sudo usermod -aG docker "$USER"
+      log_ok "User added to docker group. A new login may be required; this run will use sudo for Docker where needed."
+    else
+      die "Docker service is not ready."
+    fi
+  else
+    log_ok "Docker is ready"
+  fi
+}
+
+docker_cmd() {
+  if docker_is_ready; then
+    docker "$@"
+  elif [[ "$OS_TYPE" == "linux" ]] && need_sudo; then
+    run_sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+ensure_docker_running() {
+  if docker_is_ready; then
+    return 0
+  fi
+
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    launch_docker_macos
+  else
+    run_sudo systemctl start docker
+    if ! docker_is_ready && ! run_sudo docker info >/dev/null 2>&1; then
+      die "Docker is not running and could not be started."
+    fi
+  fi
+}
+
+install_and_setup_docker() {
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    install_docker_macos
+  else
+    install_docker_linux
+  fi
+
+  ensure_docker_running
+
+  log_info "Pulling Oracle XE image"
+  docker_cmd pull "${DOCKER_PLATFORM_ARGS[@]}" "$ORACLE_IMAGE"
+  log_ok "Oracle XE image is available"
+
+  create_oracle_container
+}
+
+container_exists() {
+  docker_cmd ps -a --format '{{.Names}}' | grep -Fxq "$ORACLE_CONTAINER"
+}
+
+container_is_running() {
+  docker_cmd ps --format '{{.Names}}' | grep -Fxq "$ORACLE_CONTAINER"
+}
+
+create_oracle_container() {
+  if container_exists; then
+    log_ok "Container $ORACLE_CONTAINER already exists"
+    return 0
+  fi
+
+  log_info "Creating Oracle XE container"
+  docker_cmd run -d \
+    "${DOCKER_PLATFORM_ARGS[@]}" \
+    --name "$ORACLE_CONTAINER" \
+    -p "${ORACLE_PORT}:1521" \
+    -e ORACLE_PASSWORD="$ORACLE_PASSWORD" \
+    --restart unless-stopped \
+    "$ORACLE_IMAGE" >/dev/null
+
+  log_ok "Container $ORACLE_CONTAINER created"
+}
+
+start_oracle_container() {
+  ensure_docker_running
+
+  if ! container_exists; then
+    create_oracle_container
+  fi
+
+  if container_is_running; then
+    log_ok "Container $ORACLE_CONTAINER is already running"
+  else
+    log_info "Starting container $ORACLE_CONTAINER"
+    docker_cmd start "$ORACLE_CONTAINER" >/dev/null
+    log_ok "Container $ORACLE_CONTAINER started"
+  fi
+}
+
+wait_for_oracle_ready() {
+  log_info "Waiting for Oracle XE to be ready"
+
+  local elapsed=0
+  while (( elapsed < READY_TIMEOUT_SECONDS )); do
+    if docker_cmd logs "$ORACLE_CONTAINER" 2>&1 | grep -Fq "DATABASE IS READY TO USE"; then
+      log_ok "Oracle XE is ready"
+      return 0
+    fi
+
+    if ! container_is_running; then
+      docker_cmd logs --tail 80 "$ORACLE_CONTAINER" >&2 || true
+      die "Container $ORACLE_CONTAINER stopped before Oracle XE became ready."
+    fi
+
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  docker_cmd logs --tail 120 "$ORACLE_CONTAINER" >&2 || true
+  die "Oracle XE did not become ready within ${READY_TIMEOUT_SECONDS}s."
+}
+
+# -----------------------------
+# Oracle Instant Client setup
+# -----------------------------
+
+download_file() {
+  local url=$1
+  local dest=$2
+
+  if [[ -f "$dest" && -s "$dest" ]]; then
+    log_ok "Downloaded file already exists: $(basename "$dest")"
+    return 0
+  fi
+
+  log_info "Downloading $(basename "$dest")"
+  curl -fL --retry 3 --retry-delay 3 -o "$dest" "$url"
+}
+
+install_instant_client() {
+  if [[ -n "$(sqlplus_path)" ]]; then
+    log_ok "SQL*Plus is already installed"
+    return 0
+  fi
+
+  ensure_dir "$INSTANTCLIENT_PARENT"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local basic_zip="$tmp_dir/instantclient-basic.zip"
+  local sqlplus_zip="$tmp_dir/instantclient-sqlplus.zip"
+
+  download_file "$IC_BASIC_URL" "$basic_zip"
+  download_file "$IC_SQLPLUS_URL" "$sqlplus_zip"
+
+  log_info "Extracting Oracle Instant Client"
+  unzip -oq "$basic_zip" -d "$INSTANTCLIENT_PARENT"
+  unzip -oq "$sqlplus_zip" -d "$INSTANTCLIENT_PARENT"
+
+  local ic_dir
+  ic_dir="$(latest_instantclient_dir)"
+  [[ -n "$ic_dir" ]] || die "Instant Client extraction did not create an instantclient_* directory."
+  [[ -x "$ic_dir/sqlplus" ]] || die "SQL*Plus binary not found after extraction: $ic_dir/sqlplus"
+
+  if [[ "$OS_TYPE" == "linux" ]]; then
+    chmod +x "$ic_dir/sqlplus" || true
+  fi
+
+  log_ok "SQL*Plus installed at $ic_dir/sqlplus"
+}
+
+# -----------------------------
+# Environment and TNS setup
+# -----------------------------
+
+setup_tnsnames() {
+  ensure_dir "$TNS_ADMIN_DIR"
+
+  cat >"$TNSNAMES_FILE" <<EOF
+XE =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = localhost)(PORT = ${ORACLE_PORT}))
+    (CONNECT_DATA =
+      (SERVICE_NAME = ${ORACLE_SERVICE})
+    )
+  )
+EOF
+
+  log_ok "Configured $TNSNAMES_FILE"
+}
+
+setup_environment() {
+  local ic_dir
+  ic_dir="$(latest_instantclient_dir)"
+  [[ -n "$ic_dir" ]] || die "Instant Client directory not found."
+
+  local marker="# >>> sqlboot environment >>>"
+  local block
+  block="$(cat <<EOF
+export SQLBOOT_ORACLE_HOME="$ORACLE_BASE_DIR"
+export TNS_ADMIN="$TNS_ADMIN_DIR"
+export PATH="$ic_dir:\$PATH"
+export ${LIB_PATH_VAR}="$ic_dir:\${${LIB_PATH_VAR}:-}"
+# <<< sqlboot environment <<<
+EOF
+)"
+
+  append_once "$PROFILE_FILE" "$marker" "$block"
+
+  export SQLBOOT_ORACLE_HOME="$ORACLE_BASE_DIR"
+  export TNS_ADMIN="$TNS_ADMIN_DIR"
+  export PATH="$ic_dir:$PATH"
+  export "$LIB_PATH_VAR=$ic_dir:${!LIB_PATH_VAR:-}"
+
+  log_ok "Environment is active for this session"
+}
+
+setup_rlwrap() {
+  touch "$SQLPLUS_HISTORY"
+  chmod 600 "$SQLPLUS_HISTORY" || true
+  log_ok "SQL*Plus history file is ready at $SQLPLUS_HISTORY"
+}
+
+# -----------------------------
+# sqlboot CLI installation
+# -----------------------------
+
+write_launcher() {
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  sed 's/^SQLBOOT_INSTALLED_MODE=.*/SQLBOOT_INSTALLED_MODE="1"/' "$0" >"$tmp_file"
+  chmod +x "$tmp_file"
+
+  log_info "Installing sqlboot command to $INSTALL_PATH"
+  run_sudo mkdir -p "$(dirname "$INSTALL_PATH")"
+  run_sudo install -m 0755 "$tmp_file" "$INSTALL_PATH"
+  rm -f "$tmp_file"
+  log_ok "Installed $INSTALL_PATH"
+}
+
+# This value is changed to "1" in /usr/local/bin/sqlboot by write_launcher.
+SQLBOOT_INSTALLED_MODE="0"
+
+# -----------------------------
+# Launcher behavior
+# -----------------------------
+
+launch_sqlplus() {
+  detect_os
+  ensure_docker_running
+  start_oracle_container
+  wait_for_oracle_ready
+
+  local spath
+  spath="$(sqlplus_path)"
+  [[ -n "$spath" ]] || die "sqlplus was not found. Run the installer again: ./sqlboot --install"
+
+  export TNS_ADMIN="$TNS_ADMIN_DIR"
+  export PATH="$(dirname "$spath"):$PATH"
+  export "$LIB_PATH_VAR=$(dirname "$spath"):${!LIB_PATH_VAR:-}"
+
+  require_command rlwrap
+
+  log_info "Launching SQL*Plus"
+  exec rlwrap -H "$SQLPLUS_HISTORY" "$spath" /nolog
+}
+
+# -----------------------------
+# Installer flow
+# -----------------------------
+
+run_install() {
+  detect_os
+  install_required_packages
+  install_and_setup_docker
+  install_instant_client
+  setup_tnsnames
+  setup_environment
+  setup_rlwrap
+  write_launcher
+  start_oracle_container
+  wait_for_oracle_ready
+
+  printf '\nSetup complete.\nRun:\nsqlboot\n\nThen inside SQL*Plus:\nconn system/1234@XE\n'
+}
+
+print_usage() {
+  cat <<EOF
+Usage:
+  sqlboot              Install when run from source; launch SQL*Plus when installed
+  sqlboot --install    Run installer
+  sqlboot --start      Start Docker Oracle XE and launch SQL*Plus
+  sqlboot --help       Show this help
+
+Environment overrides:
+  SQLBOOT_ORACLE_PASSWORD
+  SQLBOOT_ORACLE_IMAGE
+  SQLBOOT_ORACLE_CONTAINER
+  SQLBOOT_ORACLE_PORT
+  SQLBOOT_ORACLE_SERVICE
+  SQLBOOT_IC_BASIC_URL
+  SQLBOOT_IC_SQLPLUS_URL
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    --help|-h)
+      print_usage
+      ;;
+    --install)
+      run_install
+      ;;
+    --start)
+      launch_sqlplus
+      ;;
+    "")
+      if [[ "$SQLBOOT_INSTALLED_MODE" == "1" ]]; then
+        launch_sqlplus
+      else
+        run_install
+      fi
+      ;;
+    *)
+      die "Unknown option: $1. Use --help for usage."
+      ;;
+  esac
+}
+
+main "$@"
