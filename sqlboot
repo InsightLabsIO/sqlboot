@@ -425,7 +425,12 @@ wait_for_oracle_ready() {
 
   local elapsed=0
   while (( elapsed < READY_TIMEOUT_SECONDS )); do
-    if docker_cmd logs "$ORACLE_CONTAINER" 2>&1 | grep -Fq "DATABASE IS READY TO USE"; then
+    if docker_cmd logs --tail 300 "$ORACLE_CONTAINER" 2>&1 | grep -Fq "DATABASE IS READY TO USE"; then
+      log_ok "Oracle XE is ready"
+      return 0
+    fi
+
+    if sqlplus_connection_ready; then
       log_ok "Oracle XE is ready"
       return 0
     fi
@@ -441,6 +446,21 @@ wait_for_oracle_ready() {
 
   docker_cmd logs --tail 120 "$ORACLE_CONTAINER" >&2 || true
   die "Oracle XE did not become ready within ${READY_TIMEOUT_SECONDS}s."
+}
+
+sqlplus_connection_ready() {
+  local spath
+  spath="$(sqlplus_path)"
+
+  if [[ -z "$spath" ]]; then
+    return 1
+  fi
+
+  export TNS_ADMIN="$TNS_ADMIN_DIR"
+  export PATH="$(dirname "$spath"):$PATH"
+  export "$LIB_PATH_VAR=$(dirname "$spath"):${!LIB_PATH_VAR:-}"
+
+  printf 'conn system/%s@XE\nexit\n' "$ORACLE_PASSWORD" | "$spath" -L -S /nolog >/dev/null 2>&1
 }
 
 # -----------------------------

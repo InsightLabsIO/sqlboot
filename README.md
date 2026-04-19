@@ -69,3 +69,13 @@ Available overrides:
 npm run check
 npm run pack:dry
 ```
+
+## Troubleshooting
+
+If setup appears to wait at `Waiting for Oracle XE to be ready`, check the container:
+
+```sh
+docker logs --tail 120 oracle-xe
+```
+
+Recent versions of `sqlboot` check both recent Docker logs and a SQL*Plus connection probe before launching SQL*Plus.
