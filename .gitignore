@@ -16,6 +16,7 @@ dist/
 build/
 tmp/
 temp/
+*.tsbuildinfo
 
 # Environment and local config
 .env
