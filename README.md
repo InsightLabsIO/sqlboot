@@ -205,5 +205,5 @@ If Docker was newly installed on Linux, log out and back in before retrying so u
 If `npx` keeps resolving older release:
 
 ```sh
-npx sqlboot@latest
+npx sqlboot@latest init
 ```
