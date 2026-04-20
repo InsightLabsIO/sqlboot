@@ -2,6 +2,13 @@
 
 All notable changes to `sqlboot` are tracked here.
 
+## 1.0.3
+
+- Converted npm CLI entrypoint from JavaScript to TypeScript without changing runtime behavior.
+- Reorganized source into `cli`, `constants`, `helpers`, `types`, and `utils`.
+- Added Vitest coverage for help, platform checks, installer checks, and spawn behavior.
+- Updated published CLI output to `dist/cli/index.js`.
+
 ## 1.0.2
 
 - Added explicit WSL detection.
