@@ -16,6 +16,13 @@ All notable changes to `sqlboot` are tracked here.
 - Expanded `libaio.so.1` extraction fallback across multiple Ubuntu and Debian package URLs with visible repair tracing.
 - Fixed SQL*Plus `libaio.so.1` validation to test with the Instant Client directory in `LD_LIBRARY_PATH`, matching the real launch environment.
 - Expanded Windows purge to remove Ubuntu and WSL app packages where Windows exposes them.
+- Improved missing-WSL handling so Windows WSL features are installed by SQLBoot instead of only prompting the user.
+- Replaced Docker Desktop WSL integration dependency with a WSL Docker proxy to Windows Docker Desktop.
+- Expanded Windows purge to remove installed/provisioned WSL app packages and WSL capabilities where Windows allows it.
+- Changed Windows WSL setup to avoid bare `wsl --install` paths and prefer explicit `wsl --install Ubuntu`.
+- Fixed Windows purge WSL feature cleanup to also match modern dotted WSL capability names and use Windows optional-feature APIs.
+- Improved Windows purge feedback by streaming the WSL uninstall live and warning when Ubuntu may ask for the sudo password.
+- Clarified Windows purge completion output so users know SQLBoot cannot remove the Windows-owned `C:\Windows\System32\wsl.exe` system stub.
 
 ## 1.0.5
 

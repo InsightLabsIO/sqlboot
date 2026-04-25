@@ -69,7 +69,7 @@ On Windows, remove the sqlboot-managed Windows setup too:
 sqlboot uninstall --purge
 ```
 
-Purge first runs the normal WSL uninstall, then removes Docker Desktop, unregisters the Ubuntu WSL distro used by sqlboot, removes Ubuntu/WSL app packages where Windows exposes them, cleans sqlboot's Docker Desktop WSL integration setting, removes the current Windows user from `docker-users`, and disables the Windows WSL optional features. Windows may require a restart afterward.
+Purge first runs the normal WSL uninstall, then removes Docker Desktop, unregisters the Ubuntu WSL distro used by sqlboot, removes Ubuntu/WSL app packages and WSL capabilities where Windows exposes them, cleans sqlboot's Docker Desktop WSL integration setting, removes the current Windows user from `docker-users`, and disables the Windows WSL optional features. Windows may require a restart afterward. SQLBoot cannot remove the Windows-owned `C:\Windows\System32\wsl.exe` system stub, so that command may still exist even after WSL distributions, app packages, capabilities, and optional features are removed. SQLBoot does not unregister unrelated non-Ubuntu WSL distros because that can delete user data.
 
 ## Supported platforms
 
@@ -84,7 +84,7 @@ On Windows, run the npm CLI from PowerShell, Windows Terminal, or CMD:
 npx sqlboot init
 ```
 
-The Windows bootstrapper installs or starts WSL2 Ubuntu and Docker Desktop when possible, then runs the Linux setup inside WSL. Windows may ask for administrator approval, Ubuntu may ask you to create the first Linux user, and Docker Desktop may ask for first-run confirmation.
+The Windows bootstrapper installs or starts WSL2 Ubuntu and Docker Desktop when possible, then runs the Linux setup inside WSL. Windows may ask for administrator approval, Ubuntu may ask you to create the first Linux user, and Docker Desktop may ask for first-run confirmation. SQLBoot uses a WSL Docker proxy to Docker Desktop instead of requiring Docker Desktop's WSL integration toggle.
 
 ## Defaults
 

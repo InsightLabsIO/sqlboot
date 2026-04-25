@@ -104,7 +104,7 @@ need_sudo() {
 
 run_sudo() {
   if need_sudo; then
-    sudo "$@"
+    sudo -p "[sudo] Enter Ubuntu/Linux password for %u: " "$@"
   else
     "$@"
   fi
@@ -509,15 +509,21 @@ install_docker_macos() {
 
 install_docker_linux() {
   if [[ "$IS_WSL" == "1" ]]; then
+    setup_wsl_windows_docker_proxy || true
+
     if ! command_exists docker; then
-      die "Docker CLI was not found in WSL. Install Docker Desktop for Windows and enable WSL integration for this distro."
+      die "Docker CLI was not found in WSL. Start Docker Desktop on Windows, then rerun sqlboot init."
     fi
 
     if ! docker_is_ready; then
-      die "Docker is not reachable from WSL. Start Docker Desktop and enable Settings > Resources > WSL integration for this distro."
+      setup_wsl_windows_docker_proxy || true
     fi
 
-    log_ok "Docker Desktop WSL integration is ready"
+    if ! docker_is_ready; then
+      die "Docker is not reachable from WSL. Start Docker Desktop on Windows, then rerun sqlboot init."
+    fi
+
+    log_ok "Docker Desktop is reachable from WSL"
     return 0
   fi
 
@@ -545,6 +551,42 @@ install_docker_linux() {
   else
     log_ok "Docker is ready"
   fi
+}
+
+setup_wsl_windows_docker_proxy() {
+  [[ "$IS_WSL" == "1" ]] || return 1
+
+  local docker_cli=""
+  local candidate
+  for candidate in \
+    "/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe" \
+    "/mnt/c/Program Files/Docker/Docker/resources/bin/com.docker.cli.exe"
+  do
+    if [[ -f "$candidate" ]]; then
+      docker_cli="$candidate"
+      break
+    fi
+  done
+
+  [[ -n "$docker_cli" ]] || return 1
+
+  local escaped_docker_cli
+  escaped_docker_cli="$(printf '%s' "$docker_cli" | sed "s/'/'\\\\''/g")"
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+  {
+    printf '%s\n' '#!/usr/bin/env sh'
+    printf "exec '%s' \"\$@\"\n" "$escaped_docker_cli"
+  } >"$tmp_file"
+  chmod +x "$tmp_file"
+
+  run_sudo mkdir -p /usr/local/bin
+  run_sudo install -m 0755 "$tmp_file" /usr/local/bin/docker
+  rm -f "$tmp_file"
+
+  hash -r 2>/dev/null || true
+  log_ok "Configured WSL Docker proxy to Docker Desktop"
 }
 
 docker_cmd() {

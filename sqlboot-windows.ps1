@@ -126,9 +126,6 @@ $restartRequired = $LASTEXITCODE -eq 3010
 dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
 if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -eq 3010) { $restartRequired = $true }
-wsl.exe --install --no-distribution
-if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
-if ($LASTEXITCODE -eq 3010) { $restartRequired = $true }
 if ($restartRequired) { exit 3010 }
 '@
 }
@@ -136,13 +133,24 @@ if ($restartRequired) { exit 3010 }
 function Disable-WslOptionalFeatures {
   Write-Info 'Disabling Windows WSL optional features. Windows may ask for administrator approval.'
   Invoke-ElevatedPowerShell @'
-wsl.exe --shutdown
-dism.exe /online /disable-feature /featurename:VirtualMachinePlatform /norestart
-if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
-$restartRequired = $LASTEXITCODE -eq 3010
-dism.exe /online /disable-feature /featurename:Microsoft-Windows-Subsystem-Linux /norestart
-if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
-if ($LASTEXITCODE -eq 3010) { $restartRequired = $true }
+$ErrorActionPreference = 'Stop'
+& wsl.exe --shutdown 2>$null
+$restartRequired = $false
+
+$capabilities = Get-WindowsCapability -Online |
+  Where-Object {
+    ($_.Name -like 'Microsoft.Windows.Subsystem.Linux*' -or $_.Name -like 'Microsoft.WindowsSubsystemForLinux*') -and
+    $_.State -eq 'Installed'
+  }
+foreach ($capability in $capabilities) {
+  $result = Remove-WindowsCapability -Online -Name $capability.Name
+  if ($result.RestartNeeded) { $restartRequired = $true }
+}
+
+$featureResult = Disable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart
+if ($featureResult.RestartNeeded) { $restartRequired = $true }
+$featureResult = Disable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -NoRestart
+if ($featureResult.RestartNeeded) { $restartRequired = $true }
 if ($restartRequired) { exit 3010 }
 '@
 
@@ -477,13 +485,13 @@ function Invoke-WslFirstRun {
 }
 
 function Ensure-WslUbuntu {
-  Assert-WslHostReady
-
   if (-not (Test-Command 'wsl.exe')) {
-    Write-Info 'Installing WSL and Ubuntu. Windows may ask for administrator approval.'
-    Invoke-ElevatedPowerShell 'wsl --install -d Ubuntu'
-    Assert-WslHostReady
+    Write-Info 'WSL command was not found. Installing Windows WSL features. Windows may ask for administrator approval.'
+    Enable-WslOptionalFeatures
+    throw 'Windows WSL features were installed. Restart Windows, then rerun sqlboot init so SQLBoot can install Ubuntu.'
   }
+
+  Assert-WslHostReady
 
   $distro = Get-SqlbootDistro
   if (-not $distro -and $script:LastWslListError -match 'E_ACCESSDENIED|Access is denied') {
@@ -501,7 +509,10 @@ function Ensure-WslUbuntu {
   }
 
   Write-Info 'Installing Ubuntu for WSL. Finish any first-run Ubuntu account prompt if Windows opens one.'
-  & wsl.exe --install -d Ubuntu
+  & wsl.exe --install Ubuntu
+  if ($LASTEXITCODE -ne 0) {
+    & wsl.exe --install -d Ubuntu
+  }
   if ($LASTEXITCODE -ne 0) {
     Assert-WslHostReady
     throw 'Ubuntu WSL installation did not complete. Restart Windows if prompted, open Ubuntu once, then rerun sqlboot init.'
@@ -925,12 +936,8 @@ function Invoke-SqlbootInWslNoExit {
   }
 
   $args = @('-d', $Distro, '--', 'env') + $envArgs + @('bash', $WslInstallerPath) + $InstallerArgs
-  $output = & wsl.exe @args 2>&1
-  $status = $LASTEXITCODE
-  foreach ($line in $output) {
-    Write-Host $line
-  }
-  return [int]$status
+  & wsl.exe @args
+  return [int]$LASTEXITCODE
 }
 
 function Uninstall-DockerDesktop {
@@ -1005,6 +1012,20 @@ function Uninstall-WslAppPackage {
 
   Uninstall-WindowsPackageByWingetId -PackageId 'Microsoft.WSL' -DisplayName 'Windows Subsystem for Linux'
 
+  Invoke-ElevatedPowerShell @'
+$packages = Get-AppxPackage -AllUsers |
+  Where-Object { $_.Name -eq 'MicrosoftCorporationII.WindowsSubsystemForLinux' -or $_.PackageFamilyName -like 'MicrosoftCorporationII.WindowsSubsystemForLinux*' }
+foreach ($package in $packages) {
+  Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+}
+
+$provisionedPackages = Get-AppxProvisionedPackage -Online |
+  Where-Object { $_.DisplayName -eq 'MicrosoftCorporationII.WindowsSubsystemForLinux' -or $_.PackageName -like 'MicrosoftCorporationII.WindowsSubsystemForLinux*' }
+foreach ($package in $provisionedPackages) {
+  Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName | Out-Null
+}
+'@
+
   $wslPackages = Get-AppxPackage |
     Where-Object { $_.Name -eq 'MicrosoftCorporationII.WindowsSubsystemForLinux' -or $_.PackageFamilyName -like 'MicrosoftCorporationII.WindowsSubsystemForLinux*' }
 
@@ -1037,6 +1058,8 @@ function Run-WindowsPurge {
   )
 
   Write-Info 'Running normal sqlboot uninstall before Windows purge'
+  Write-Info "Ubuntu may ask for your Linux sudo password while removing /usr/local/bin/sqlboot."
+  Write-Info 'If a password prompt appears, type the Ubuntu password you created during WSL setup.'
   $status = Invoke-SqlbootInWslNoExit -Distro $Distro -WslInstallerPath $WslInstallerPath -InstallerArgs @('uninstall')
   if ($status -ne 0) {
     throw "Normal sqlboot uninstall failed with exit code $status. Purge stopped before removing Windows-side dependencies."
@@ -1052,6 +1075,10 @@ function Run-WindowsPurge {
 
   Write-Host ''
   Write-Host 'Purge complete.'
+  Write-Info 'Restart Windows to finish applying WSL feature and app package removal.'
+  Write-Info 'SQLBoot removes supported WSL distros, app packages, capabilities, and optional features.'
+  Write-Info 'SQLBoot cannot remove the Windows-owned C:\Windows\System32\wsl.exe system stub.'
+  Write-Info 'After restart, run "wsl -l -v" to confirm Windows reports no installed distributions.'
   exit 0
 }
 
